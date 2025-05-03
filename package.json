@@ -1,0 +1,22 @@
+{
+  "name": "U w.i.t.h.",
+  "version": "1.4.9",
+  "description": "You with inspiring transformative heartfelt BOT-- 感動的な変革をもたらすハートフルなBOTをあなたに。",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "type": "module",
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "fastify": "^4.21.0",
+    "handlebars": "^4.7.8",
+    "js-yaml": "^4.1.0",
+    "node-fetch": "^2.7.0",
+    "node-schedule": "^2.1.1"
+  },
+  "license": "MIT"
+}

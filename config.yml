@@ -1,0 +1,23 @@
+# ボットのトークン
+token: "MTI0NDY1NDA2MjM3MzMwNjM4OA.G3u295.CVka70sPwMLzOzpNUUoztFVhSDuCpS37aBDxiA"
+
+# ボットのID
+clientId: "1244654062373306388"
+
+# タイツサーバのID
+guildId: "1200831372235911230"
+
+# 許可されたチャンネルIDのリスト
+allowedChannelIds:
+  - "1200851072584007842"
+  - "1244360834256339025"
+
+# ログチャンネルのID
+logChannelId: "1247915108777332807"
+
+# メッセージ削除の対象外とする絵文字
+lockEmoji: "🔒️"
+
+# メッセージを削除するまでの秒数
+deleteTime: 300
+
