@@ -111,6 +111,10 @@ client.on('messageCreate', async (_message) => {
       }
       logContent += `>>> ${cleanedMessage}\n`;
 
+      // ログを送信
+      await logChannel.send(logContent);
+
+      // ファイルが含まれていた場合、ファイルをコピーして送信
       if (_message.attachments.size > 0) {
         const tempDir = path.join(process.cwd(), 'temp');
         if (!fs.existsSync(tempDir)) {
@@ -122,13 +126,21 @@ client.on('messageCreate', async (_message) => {
           const filePath = path.join(tempDir, fileName);
           const response = await fetch(attachment.url);
           const buffer = await response.buffer();
-          fs.writeFileSync(filePath, buffer);
-          await logChannel.send({ files: [filePath] });
-          fs.unlinkSync(filePath);
+          const MAX_SIZE = 8 * 1024 * 1024; // 8MB
+
+          // ファイルサイズをチェック
+          if (attachment.size <= MAX_SIZE) {
+            // ファイルを一時ファイルとして保存してログに流す
+            fs.writeFileSync(filePath, buffer);
+            await logChannel.send({ files: [filePath] });
+            // 一時ファイルを削除
+            fs.unlinkSync(filePath);
+          }
+          else {
+            console.error('ファイルサイズが大きすぎたため、ログサーバに送信できませんでした');
+          }
         }
       }
-
-      await logChannel.send(logContent);
     }
 
     scheduleMessageDeletion(_message);
