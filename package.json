@@ -16,7 +16,9 @@
     "handlebars": "^4.7.8",
     "js-yaml": "^4.1.0",
     "node-fetch": "^2.7.0",
-    "node-schedule": "^2.1.1"
+    "node-schedule": "^2.1.1",
+    "undici": "^7.8.0",
+    "web-streams-polyfill": "^4.1.0"
   },
   "license": "MIT"
 }
