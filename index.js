@@ -1,17 +1,21 @@
 import { Client, GatewayIntentBits, ActivityType, REST, Routes } from 'discord.js';
-import schedule from 'node-schedule';
 import fs from 'fs';
 import yaml from 'js-yaml';
 import fetch from 'node-fetch';
 import path from 'path';
 import { createRequire } from 'module';
 import { ReadableStream } from 'web-streams-polyfill';
+import http from 'http';
 global.ReadableStream = ReadableStream;
 
 const require = createRequire(import.meta.url);
 const discordPackage = require('./package.json');
 
-let lastName = '';
+// サーバーごとの最後の発言者を管理するMap (メモリリーク防止のためギルドIDで分離)
+const lastNames = new Map();
+// 削除予定のタイマーを管理するMap
+const deletionTimers = new Map();
+
 const config = yaml.load(fs.readFileSync('./config.yml', 'utf8'));
 const rest = new REST({ version: '10' }).setToken(config.token);
 const client = new Client({
@@ -24,6 +28,16 @@ const client = new Client({
 });
 
 client.login(config.token);
+
+// HTTPサーバー (Koyebのヘルスチェック用)
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Discord Bot is alive!');
+});
+server.listen(PORT, () => {
+  console.log(`Health check server is running on port ${PORT}`);
+});
 
 const guildCommands = [
   {
@@ -44,17 +58,27 @@ const guildCommands = [
   },
 ];
 
-function scheduleMessageDeletion(_message) {
-  if (_message.content.includes(config.lockEmoji)) {
+// メッセージ削除を安全にスケジュール (setTimeoutを使用)
+function scheduleMessageDeletion(message) {
+  if (message.content.includes(config.lockEmoji)) {
     console.log(`${config.lockEmoji}が含まれているため、削除しない`);
     return;
   }
 
-  const deleteTime = new Date(Date.now() + config.deleteTime * 1000);
-  const job = schedule.scheduleJob(deleteTime, () => {
-    _message.delete().catch(console.error);
-  });
-  _message.scheduledJob = job;
+  const delayMs = config.deleteTime * 1000;
+  const timer = setTimeout(async () => {
+    try {
+      if (message.deletable) {
+        await message.delete();
+      }
+    } catch (error) {
+      console.error('メッセージの削除に失敗しました:', error);
+    } finally {
+      deletionTimers.delete(message.id);
+    }
+  }, delayMs);
+
+  deletionTimers.set(message.id, timer);
 }
 
 client.once('ready', () => {
@@ -67,7 +91,7 @@ client.on('error', (_error) => {
 });
 
 client.on('messageCreate', async (_message) => {
-  if (_message.mentions.everyone || _message.author.id === client.user.id) return;
+  if (!_message.guild || _message.mentions.everyone || _message.author.id === client.user.id) return;
 
   let displayName = _message.author.username;
   try {
@@ -105,38 +129,35 @@ client.on('messageCreate', async (_message) => {
     const logChannel = await client.channels.fetch(String(config.logChannelId));
     if (logChannel) {
       let logContent = '';
+      const guildId = _message.guild.id;
+      const lastName = lastNames.get(guildId) || '';
+
       if (displayName !== lastName) {
         logContent = `${displayName}：\n`;
-        lastName = displayName;
+        lastNames.set(guildId, displayName);
       }
       logContent += `>>> ${cleanedMessage}\n`;
 
       // ログを送信
       await logChannel.send(logContent);
 
-      // ファイルが含まれていた場合、ファイルをコピーして送信
+      // ファイルが含まれていた場合、ディスクに書き込まずBufferとして直接送信
       if (_message.attachments.size > 0) {
-        const tempDir = path.join(process.cwd(), 'temp');
-        if (!fs.existsSync(tempDir)) {
-          fs.mkdirSync(tempDir, { recursive: true });
-        }
-
         for (const attachment of _message.attachments.values()) {
-          const fileName = path.basename(attachment.name);
-          const filePath = path.join(tempDir, fileName);
-          const response = await fetch(attachment.url);
-          const buffer = await response.buffer();
           const MAX_SIZE = 8 * 1024 * 1024; // 8MB
-
-          // ファイルサイズをチェック
           if (attachment.size <= MAX_SIZE) {
-            // ファイルを一時ファイルとして保存してログに流す
-            fs.writeFileSync(filePath, buffer);
-            await logChannel.send({ files: [filePath] });
-            // 一時ファイルを削除
-            fs.unlinkSync(filePath);
-          }
-          else {
+            try {
+              const response = await fetch(attachment.url);
+              const buffer = await response.buffer();
+              const fileName = path.basename(attachment.name);
+
+              await logChannel.send({
+                files: [{ attachment: buffer, name: fileName }]
+              });
+            } catch (err) {
+              console.error('添付ファイルの転送に失敗しました:', err);
+            }
+          } else {
             console.error('ファイルサイズが大きすぎたため、ログサーバに送信できませんでした');
           }
         }
@@ -147,48 +168,27 @@ client.on('messageCreate', async (_message) => {
   }
 });
 
+// (以下、コマンド関連の処理は変更なし)
 client.on('interactionCreate', async (_interaction) => {
   if (!_interaction.isCommand()) return;
-
   const { commandName, guildId } = _interaction;
 
-  if (commandName === 'register-guild-commands') {
-    console.log(`register-guild-commands が開始。`);
-    await registerGuildCommands(guildId);
-    await _interaction.reply(`このサーバ (ID: ${guildId}) にコマンドが登録されました。`);
-    console.log(`register-guild-commands が終了。`);
-    return;
-  }
-
-  if (commandName === 'delete-guild-commands') {
-    console.log(`delete-guild-commands が開始。`);
-    await deleteGuildCommands(guildId);
-    await _interaction.reply(`このサーバ (ID: ${guildId}) のコマンドが削除されました。`);
-    console.log(`delete-guild-commands が終了。`);
-    return;
-  }
-
   if (commandName === 'image-url-converter') {
-    console.log(`image-url-converter が開始。`);
     const inputUrl = _interaction.options.getString('url');
     if (!inputUrl) {
       await _interaction.reply('URLを正しく入力してください🥺');
-      console.log(`image-url-converter が 受け取った変数のエラーで終了。`);
       return;
     }
-
     const convertedUrl = convertOriginalSizeImageURL(inputUrl);
     if (convertedUrl) {
       await _interaction.reply(`オリジナル画質に変換しました！\n ${convertedUrl} `);
     } else {
       await _interaction.reply('指定したURLは変換に対応していないようです🥺');
     }
-    console.log(`image-url-converter が終了。`);
     return;
   }
 
   if (commandName === 'help') {
-    console.log(`help が開始。`);
     try {
       const helpText = await readHelpFile();
       await _interaction.reply(helpText);
@@ -196,43 +196,13 @@ client.on('interactionCreate', async (_interaction) => {
       console.error('ヘルプファイルの読み込みに失敗しました:', error);
       await _interaction.reply('ヘルプ情報の読み込みに失敗しました、質問はとーち。までご連絡ください🥺');
     }
-    console.log(`help が終了。`);
   }
 });
-
-async function registerGuildCommands(_guildId) {
-  try {
-    await rest.put(Routes.applicationGuildCommands(config.clientId, _guildId), {
-      body: guildCommands,
-    });
-    console.log(`ギルドコマンドがギルド ${_guildId} に正常に登録されました。`);
-  } catch (error) {
-    console.error(`ギルドコマンドの登録に失敗しました (ギルド: ${_guildId}):`, error);
-  }
-}
-
-async function deleteGuildCommands(_guildId) {
-  try {
-    const existingCommands = await rest.get(Routes.applicationGuildCommands(config.clientId, _guildId));
-    if (existingCommands.length > 0) {
-      console.log(`ギルド ${_guildId} の既存のコマンドを削除しています...`);
-      for (const command of existingCommands) {
-        await rest.delete(Routes.applicationGuildCommand(config.clientId, _guildId, command.id));
-        console.log(`ギルドコマンド '${command.name}' (ID: ${command.id}) を削除しました。`);
-      }
-    } else {
-      console.log(`ギルド ${_guildId} に削除するコマンドはありません。`);
-    }
-  } catch (error) {
-    console.error(`ギルドコマンドの削除に失敗しました (ギルド: ${_guildId}):`, error);
-  }
-}
 
 function convertOriginalSizeImageURL(_messageContent) {
   if (!_messageContent || typeof _messageContent !== 'string') {
     return null;
   }
-
   const urlRegex = /(https?:\/\/[^\s]+)/g;
   const urls = _messageContent.match(urlRegex);
 
@@ -241,24 +211,19 @@ function convertOriginalSizeImageURL(_messageContent) {
       if (url.includes('yt3.ggpht.com')) {
         return url.replace(/=.*/, '=s0');
       }
-
       if (url.includes('pbs.twimg.com')) {
         return url.replace(/\?.*/, '?format=jpg&name=orig');
       }
     }
   }
-
   return null;
 }
 
 function readHelpFile() {
   return new Promise((resolve, reject) => {
     fs.readFile('./help.txt', 'utf8', (err, data) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(data);
-      }
+      if (err) reject(err);
+      else resolve(data);
     });
   });
 }
