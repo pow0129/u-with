@@ -300,14 +300,20 @@ client.on('error', (_error) => {
 // 先に削除されたメッセージのキュー情報を解放する
 client.on('messageDelete', (message) => {
   if (!message?.id) return;
-  void runDeletionDb('DELETE FROM pending_deletions WHERE message_id = ?', [String(message.id)])
-    .catch((error) => console.error('削除済みメッセージ情報の整理に失敗しました:', error));
+  try {
+    runDeletionDb('DELETE FROM pending_deletions WHERE message_id = ?', [String(message.id)]);
+  } catch (error) {
+    console.error('削除済みメッセージ情報の整理に失敗しました:', error);
+  }
 });
 
 client.on('channelDelete', (channel) => {
   if (!channel?.id) return;
-  void runDeletionDb('DELETE FROM pending_deletions WHERE channel_id = ?', [String(channel.id)])
-    .catch((error) => console.error('削除チャンネル情報の整理に失敗しました:', error));
+  try {
+    runDeletionDb('DELETE FROM pending_deletions WHERE channel_id = ?', [String(channel.id)]);
+  } catch (error) {
+    console.error('削除チャンネル情報の整理に失敗しました:', error);
+  }
   if (channel.id === String(config.logChannelId || '')) {
     console.warn('ログチャンネルが削除されました。');
   }
