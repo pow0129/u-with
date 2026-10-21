@@ -5,6 +5,7 @@ import fetch from 'node-fetch';
 import path from 'path';
 import { createRequire } from 'module';
 import { ReadableStream } from 'web-streams-polyfill';
+import sqlite3 from 'sqlite3';
 import http from 'http';
 import 'dotenv/config';
 
@@ -29,15 +30,24 @@ const MAX_TOTAL_ATTACHMENTS = 16 * 1024 * 1024; // 1メッセージ合計 16MB
 const MAX_BUFFER_BUDGET = 64 * 1024 * 1024; // 同時にメモリに載る総量の目安 64MB
 const FETCH_TIMEOUT_MS = 15000;
 
-// 保留中の削除タイマーの上限（暴走時の無限増加を防ぐ）
-const MAX_PENDING_DELETIONS = 5000;
+const DELETION_CHECK_INTERVAL_MS = 30 * 1000;
+const DELETION_BATCH_SIZE = 25;
+const DELETION_CONCURRENCY = 5;
+const RETRY_BASE_DELAY_MS = 60 * 1000;
+const RETRY_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
 
 // サーバーごとの最後の発言者（ギルド数ぶんしか増えないが、上限も設ける）
 const lastNames = new Map();
 const MAX_LAST_NAMES = 1000;
 
-// 削除予定のタイマー（メッセージID -> Timeout）
-const deletionTimers = new Map();
+const DELETION_DB_PATH = process.env.DELETION_DB_PATH || path.resolve('./data/deletion-queue.sqlite');
+fs.mkdirSync(path.dirname(DELETION_DB_PATH), { recursive: true });
+const deletionDb = new sqlite3.Database(DELETION_DB_PATH);
+deletionDb.on('error', (error) => {
+  console.error('削除キューDBでエラーが発生しました:', error);
+});
+let deletionCheckInterval = null;
+let deletionPollRunning = false;
 
 // 添付ファイル転送で同時に確保しているバッファ量
 let bufferBudgetUsed = 0;
@@ -70,6 +80,7 @@ process.on('uncaughtException', (error) => {
   console.error('捕捉されない例外:', error);
 });
 
+await initializeDeletionStore();
 client.login(TOKEN);
 
 //------------------------------
@@ -144,8 +155,48 @@ function rememberLastName(guildId, name) {
   lastNames.set(guildId, name);
 }
 
-// メッセージ削除を安全にスケジュール (setTimeoutを使いメモリリークを防止)
-function scheduleMessageDeletion(message) {
+function runDeletionDb(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    deletionDb.run(sql, params, function (error) {
+      if (error) {
+        reject(error);
+      } else {
+        resolve({ changes: this.changes, lastID: this.lastID });
+      }
+    });
+  });
+}
+
+function allDeletionDb(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    deletionDb.all(sql, params, (error, rows) => {
+      if (error) reject(error);
+      else resolve(rows);
+    });
+  });
+}
+
+async function initializeDeletionStore() {
+  await runDeletionDb('PRAGMA journal_mode = WAL');
+  await runDeletionDb('PRAGMA synchronous = NORMAL');
+  await runDeletionDb(`
+    CREATE TABLE IF NOT EXISTS pending_deletions (
+      message_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      delete_at INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await runDeletionDb(`
+    CREATE INDEX IF NOT EXISTS idx_pending_deletions_due
+    ON pending_deletions (delete_at, next_attempt_at)
+  `);
+  console.log(`削除キューDBを使用します: ${DELETION_DB_PATH}`);
+}
+
+async function scheduleMessageDeletion(message) {
   if (!message?.id) return;
 
   if (message.content && message.content.includes(LOCK_EMOJI)) {
@@ -153,39 +204,92 @@ function scheduleMessageDeletion(message) {
     return;
   }
 
-  // 二重登録を防ぐ（同じメッセージに対して setTimeout を積まない）
-  if (deletionTimers.has(message.id)) return;
+  const createdAt = Number.isFinite(message.createdTimestamp)
+    ? message.createdTimestamp
+    : Date.now();
 
-  const timer = setTimeout(async () => {
-    try {
-      if (message.deletable) {
-        await message.delete();
-      }
-    } catch (error) {
-      // 既に削除済み(Unknown Message)などは無視してよい
-      if (error?.code !== 10008) {
-        console.error('メッセージの削除に失敗しました:', error);
-      }
-    } finally {
-      deletionTimers.delete(message.id);
-    }
-  }, DELETE_DELAY_MS);
-
-  // Map が無制限に膨らまないように、上限超過時は追跡せず発火させる
-  if (deletionTimers.size >= MAX_PENDING_DELETIONS) {
-    console.warn('削除待ちタイマーが上限に達したため、追跡せずに削除を実行します。');
-    return;
+  try {
+    await runDeletionDb(
+      `INSERT OR IGNORE INTO pending_deletions
+       (message_id, channel_id, created_at, delete_at)
+       VALUES (?, ?, ?, ?)`,
+      [String(message.id), String(message.channelId), createdAt, createdAt + DELETE_DELAY_MS],
+    );
+  } catch (error) {
+    console.error('削除予定メッセージの保存に失敗しました:', error);
   }
-
-  deletionTimers.set(message.id, timer);
 }
 
-function cancelMessageDeletion(messageId) {
-  const timer = deletionTimers.get(messageId);
-  if (timer) {
-    clearTimeout(timer);
-    deletionTimers.delete(messageId);
+async function deletePendingMessage(job) {
+  try {
+    const channel = client.channels.cache.get(job.channel_id)
+      ?? await client.channels.fetch(job.channel_id);
+
+    if (!channel?.isTextBased() || !channel.messages) {
+      await runDeletionDb('DELETE FROM pending_deletions WHERE message_id = ?', [job.message_id]);
+      return;
+    }
+
+    const message = await channel.messages.fetch(job.message_id);
+    if (!message.deletable) {
+      throw new Error('Botにメッセージ削除権限がありません');
+    }
+    await message.delete();
+    await runDeletionDb('DELETE FROM pending_deletions WHERE message_id = ?', [job.message_id]);
+  } catch (error) {
+    if (error?.code === 10003 || error?.code === 10008) {
+      await runDeletionDb('DELETE FROM pending_deletions WHERE message_id = ?', [job.message_id]);
+      return;
+    }
+
+    const attempts = job.attempts + 1;
+    const retryDelay = Math.min(
+      RETRY_MAX_DELAY_MS,
+      RETRY_BASE_DELAY_MS * (2 ** Math.min(job.attempts, 8)),
+    );
+    await runDeletionDb(
+      `UPDATE pending_deletions
+       SET attempts = ?, next_attempt_at = ?
+       WHERE message_id = ?`,
+      [attempts, Date.now() + retryDelay, job.message_id],
+    );
+    console.error(`メッセージ削除に失敗しました (${job.message_id}):`, error);
   }
+}
+
+async function processExpiredDeletions() {
+  if (deletionPollRunning) return;
+  deletionPollRunning = true;
+
+  try {
+    const now = Date.now();
+    const jobs = await allDeletionDb(
+      `SELECT message_id, channel_id, attempts
+       FROM pending_deletions
+       WHERE delete_at <= ? AND next_attempt_at <= ?
+       ORDER BY delete_at
+       LIMIT ?`,
+      [now, now, DELETION_BATCH_SIZE],
+    );
+
+    for (let index = 0; index < jobs.length; index += DELETION_CONCURRENCY) {
+      const batch = jobs.slice(index, index + DELETION_CONCURRENCY);
+      await Promise.all(batch.map(deletePendingMessage));
+    }
+  } catch (error) {
+    console.error('期限切れメッセージの確認に失敗しました:', error);
+  } finally {
+    deletionPollRunning = false;
+  }
+}
+
+function closeDeletionStore() {
+  return new Promise((resolve, reject) => {
+    deletionDb.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 }
 
 async function replySafely(interaction, content) {
@@ -206,19 +310,27 @@ async function replySafely(interaction, content) {
 client.once('ready', () => {
   client.user.setActivity('⚡️', { type: ActivityType.Custom, state: `⚡️Ver.${discordPackage.version}` });
   console.log(`${client.user.tag} がログインしました！`);
+  void processExpiredDeletions();
+  deletionCheckInterval = setInterval(() => {
+    void processExpiredDeletions();
+  }, DELETION_CHECK_INTERVAL_MS);
 });
 
 client.on('error', (_error) => {
   console.error('クライアントエラー：', _error);
 });
 
-// メッセージが先に消えた場合はタイマーを解放する
+// 先に削除されたメッセージのキュー情報を解放する
 client.on('messageDelete', (message) => {
-  if (message?.id) cancelMessageDeletion(message.id);
+  if (!message?.id) return;
+  void runDeletionDb('DELETE FROM pending_deletions WHERE message_id = ?', [String(message.id)])
+    .catch((error) => console.error('削除済みメッセージ情報の整理に失敗しました:', error));
 });
 
 client.on('channelDelete', (channel) => {
   if (!channel?.id) return;
+  void runDeletionDb('DELETE FROM pending_deletions WHERE channel_id = ?', [String(channel.id)])
+    .catch((error) => console.error('削除チャンネル情報の整理に失敗しました:', error));
   if (channel.id === String(config.logChannelId || '')) {
     console.warn('ログチャンネルが削除されました。');
   }
@@ -242,11 +354,11 @@ client.on('messageCreate', async (_message) => {
           await _message.channel.send(`オリジナル画質に変換しました！\n ${convertedUrl} `);
         } else if (cleanedMessage) {
           const sentMessage = await _message.channel.send(cleanedMessage);
-          if (inAllowedChannel) scheduleMessageDeletion(sentMessage);
+          if (inAllowedChannel) await scheduleMessageDeletion(sentMessage);
         }
       } else if (cleanedMessage) {
         const sentMessage = await _message.channel.send(cleanedMessage);
-        if (inAllowedChannel) scheduleMessageDeletion(sentMessage);
+        if (inAllowedChannel) await scheduleMessageDeletion(sentMessage);
       }
       await _message.delete().catch((error) => {
         if (error?.code !== 10008) console.error('メンション元メッセージの削除に失敗しました:', error);
@@ -255,6 +367,7 @@ client.on('messageCreate', async (_message) => {
     }
 
     if (!inAllowedChannel) return;
+  await scheduleMessageDeletion(_message);
 
     const logChannel = await getLogChannel();
     if (logChannel) {
@@ -301,6 +414,7 @@ client.on('messageCreate', async (_message) => {
 
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+          bufferBudgetUsed += attachment.size;
 
           try {
             const response = await fetch(attachment.url, { signal: controller.signal });
@@ -308,7 +422,6 @@ client.on('messageCreate', async (_message) => {
               throw new Error(`添付ファイルの取得に失敗 (HTTP ${response.status})`);
             }
 
-            bufferBudgetUsed += attachment.size;
             const buffer = await response.buffer();
             const fileName = path.basename(attachment.name || 'file');
 
@@ -325,7 +438,6 @@ client.on('messageCreate', async (_message) => {
       }
     }
 
-    scheduleMessageDeletion(_message);
   } catch (error) {
     console.error('messageCreate の処理でエラーが発生しました:', error);
   }
@@ -457,14 +569,12 @@ function readHelpFile() {
 async function shutdown(signal) {
   console.log(`${signal} を受信したため終了処理を行います...`);
 
-  for (const timer of deletionTimers.values()) {
-    clearTimeout(timer);
-  }
-  deletionTimers.clear();
+  if (deletionCheckInterval) clearInterval(deletionCheckInterval);
   lastNames.clear();
 
   server.close();
   await client.destroy();
+  await closeDeletionStore();
   process.exit(0);
 }
 
