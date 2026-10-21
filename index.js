@@ -284,7 +284,7 @@ async function replySafely(interaction, content) {
 //------------------------------
 // イベント
 //------------------------------
-client.once('ready', () => {
+client.once('clientReady', () => {
   client.user.setActivity('⚡️', { type: ActivityType.Custom, state: `⚡️Ver.${discordPackage.version}` });
   console.log(`${client.user.tag} がログインしました！`);
   void processExpiredDeletions();
