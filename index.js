@@ -5,7 +5,7 @@ import fetch from 'node-fetch';
 import path from 'path';
 import { createRequire } from 'module';
 import { ReadableStream } from 'web-streams-polyfill';
-import sqlite3 from 'sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import http from 'http';
 import 'dotenv/config';
 
@@ -42,10 +42,7 @@ const MAX_LAST_NAMES = 1000;
 
 const DELETION_DB_PATH = process.env.DELETION_DB_PATH || path.resolve('./data/deletion-queue.sqlite');
 fs.mkdirSync(path.dirname(DELETION_DB_PATH), { recursive: true });
-const deletionDb = new sqlite3.Database(DELETION_DB_PATH);
-deletionDb.on('error', (error) => {
-  console.error('削除キューDBでエラーが発生しました:', error);
-});
+const deletionDb = new DatabaseSync(DELETION_DB_PATH, { timeout: 5000 });
 let deletionCheckInterval = null;
 let deletionPollRunning = false;
 
@@ -156,30 +153,17 @@ function rememberLastName(guildId, name) {
 }
 
 function runDeletionDb(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    deletionDb.run(sql, params, function (error) {
-      if (error) {
-        reject(error);
-      } else {
-        resolve({ changes: this.changes, lastID: this.lastID });
-      }
-    });
-  });
+  return deletionDb.prepare(sql).run(...params);
 }
 
 function allDeletionDb(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    deletionDb.all(sql, params, (error, rows) => {
-      if (error) reject(error);
-      else resolve(rows);
-    });
-  });
+  return deletionDb.prepare(sql).all(...params);
 }
 
 async function initializeDeletionStore() {
-  await runDeletionDb('PRAGMA journal_mode = WAL');
-  await runDeletionDb('PRAGMA synchronous = NORMAL');
-  await runDeletionDb(`
+  deletionDb.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
     CREATE TABLE IF NOT EXISTS pending_deletions (
       message_id TEXT PRIMARY KEY,
       channel_id TEXT NOT NULL,
@@ -187,11 +171,9 @@ async function initializeDeletionStore() {
       delete_at INTEGER NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_at INTEGER NOT NULL DEFAULT 0
-    )
-  `);
-  await runDeletionDb(`
+    );
     CREATE INDEX IF NOT EXISTS idx_pending_deletions_due
-    ON pending_deletions (delete_at, next_attempt_at)
+    ON pending_deletions (delete_at, next_attempt_at);
   `);
   console.log(`削除キューDBを使用します: ${DELETION_DB_PATH}`);
 }
@@ -284,12 +266,7 @@ async function processExpiredDeletions() {
 }
 
 function closeDeletionStore() {
-  return new Promise((resolve, reject) => {
-    deletionDb.close((error) => {
-      if (error) reject(error);
-      else resolve();
-    });
-  });
+  deletionDb.close();
 }
 
 async function replySafely(interaction, content) {

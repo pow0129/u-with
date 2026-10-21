@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "3000"
+      DELETION_DB_PATH: /data/deletion-queue.sqlite
+    ports:
+      - "3000:3000"
+    volumes:
+      - deletion-data:/data
+
+volumes:
+  deletion-data:
